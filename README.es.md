@@ -10,6 +10,8 @@ El receptor muestra actividad DMR y P25 Phase 1. Con el módulo de voz
 instalado, reproduce DMR convencional sin cifrar. La voz P25 y la
 decodificación completa de datos digitales siguen pendientes.
 
+![Demostración de SDR Studio con el espectro RF y la cascada](docs/images/sdr-studio-demo-es.webp)
+
 ## Estado real
 
 | Función | Estado |
@@ -48,6 +50,8 @@ cargo build --release --locked
 Usa **Idioma / Language** en la parte superior del panel izquierdo para
 alternar entre **Español** y **English** sin reiniciar. La elección se guarda
 con los ajustes de la radio.
+
+![Selector de idioma con Español y English](docs/images/sdr-studio-language.webp)
 
 Selecciona **RTL-SDR · USB** y pulsa **Encender**. La tasa inicial de 240000 S/s
 reduce la carga. La aplicación abre con el modo **WFM** y 100 MHz como punto de

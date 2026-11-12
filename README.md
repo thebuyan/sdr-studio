@@ -2,6 +2,8 @@
 
 SDR Studio is an experimental Linux desktop receiver for RTL-SDR, written in Rust with egui. The interface is available in English and Spanish. [Guía en español](README.es.md)
 
+![SDR Studio demo showing the RF spectrum and waterfall](docs/images/sdr-studio-demo-en.webp)
+
 ## Features
 
 - RTL-SDR over USB, `rtl_tcp`, headerless interleaved CU8 IQ files, and a synthetic IQ demo.
@@ -26,6 +28,8 @@ cargo build --release --locked
 The demo runs without radio hardware. To use a dongle, launch without `--demo`, select **RTL-SDR · USB**, and start the receiver. The system needs a compatible `librtlsdr` and USB permissions for the device. Audio playback uses `paplay` with PulseAudio or PipeWire's PulseAudio compatibility layer.
 
 Use **Idioma / Language** at the top of the left panel to select **English**. The application remembers the language and receiver settings across sessions. Press the power button to resume reception after reopening it.
+
+![Language menu with Español and English options](docs/images/sdr-studio-language.webp)
 
 ## Optional DMR voice
 
