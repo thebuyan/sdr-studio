@@ -23,6 +23,9 @@ pub struct Dsp {
     pub spectrum: Vec<f32>,
     pub spectrum_frame: u64,
     fft_buffer: Vec<Complex32>,
+    fft_skip: usize,
+    fft_gap: usize,
+    window: [f32; FFT_SIZE],
     fft: Arc<dyn rustfft::Fft<f32>>,
 }
 
@@ -40,6 +43,13 @@ impl Dsp {
             spectrum: vec![-100.0; FFT_SIZE],
             spectrum_frame: 0,
             fft_buffer: Vec::with_capacity(FFT_SIZE),
+            fft_skip: 0,
+            // At wider spans, cap FFT analysis at roughly 250 frames/s.
+            // The UI publishes at 25 frames/s and demodulation uses every sample.
+            fft_gap: (sample_rate as usize / 250).saturating_sub(FFT_SIZE),
+            window: std::array::from_fn(|n| {
+                0.5 - 0.5 * (std::f32::consts::TAU * n as f32 / (FFT_SIZE - 1) as f32).cos()
+            }),
             fft: FftPlanner::new().plan_fft_forward(FFT_SIZE),
         }
     }
@@ -53,56 +63,62 @@ impl Dsp {
         self.count = 0;
         if hardware_changed {
             self.fft_buffer.clear();
+            self.fft_skip = 0;
         }
     }
 
     pub fn process(&mut self, bytes: &[u8], emit: impl FnMut(DigitalEvent)) {
-        self.process_samples(iq_samples(bytes).map(|iq| (iq, iq)), emit);
+        self.process_samples(iq_samples(bytes).map(|iq| (iq, iq)), true, emit);
     }
 
     pub fn process_samples(
         &mut self,
         samples: impl Iterator<Item = (Complex32, Complex32)>,
+        decode: bool,
         mut emit: impl FnMut(DigitalEvent),
     ) {
         for (raw, x) in samples {
-            // A single pole channel filter is a prototype, not a production channelizer.
-            self.filtered += (x - self.filtered) * self.alpha;
-            let product = self.filtered * self.previous.conj();
-            self.previous = self.filtered;
-            let hz = product.arg() * self.sample_rate / (2.0 * std::f32::consts::PI);
-            if let Some(event) = self.dmr.push(hz) {
-                use crate::dmr_sync::Event;
-                emit(match event {
-                    Event::Sync(sync) => DigitalEvent::Dmr(sync),
-                    Event::Voice(burst, first) => DigitalEvent::DmrVoice(burst, first),
-                });
+            if decode {
+                // A single pole channel filter is a prototype, not a production channelizer.
+                self.filtered += (x - self.filtered) * self.alpha;
+                let product = self.filtered * self.previous.conj();
+                self.previous = self.filtered;
+                let hz = product.arg() * self.sample_rate / (2.0 * std::f32::consts::PI);
+                if let Some(event) = self.dmr.push(hz) {
+                    use crate::dmr_sync::Event;
+                    emit(match event {
+                        Event::Sync(sync) => DigitalEvent::Dmr(sync),
+                        Event::Voice(burst, first) => DigitalEvent::DmrVoice(burst, first),
+                    });
+                }
+                self.integrator += hz;
+                self.count += 1;
+                self.symbol_clock += 4800.0;
+                if self.symbol_clock >= self.sample_rate {
+                    self.symbol_clock -= self.sample_rate;
+                    let frequency = self.integrator / self.count as f32;
+                    // C4FM: +1800 => 01, +600 => 00, -600 => 10, -1800 => 11.
+                    emit(DigitalEvent::Dibit(if frequency > 1200.0 {
+                        1
+                    } else if frequency > 0.0 {
+                        0
+                    } else if frequency > -1200.0 {
+                        2
+                    } else {
+                        3
+                    }));
+                    self.integrator = 0.0;
+                    self.count = 0;
+                }
             }
-            self.integrator += hz;
-            self.count += 1;
-            self.symbol_clock += 4800.0;
-            if self.symbol_clock >= self.sample_rate {
-                self.symbol_clock -= self.sample_rate;
-                let frequency = self.integrator / self.count as f32;
-                // C4FM: +1800 => 01, +600 => 00, -600 => 10, -1800 => 11.
-                emit(DigitalEvent::Dibit(if frequency > 1200.0 {
-                    1
-                } else if frequency > 0.0 {
-                    0
-                } else if frequency > -1200.0 {
-                    2
-                } else {
-                    3
-                }));
-                self.integrator = 0.0;
-                self.count = 0;
+            if self.fft_skip > 0 {
+                self.fft_skip -= 1;
+                continue;
             }
             self.fft_buffer.push(raw);
             if self.fft_buffer.len() == FFT_SIZE {
-                for (n, v) in self.fft_buffer.iter_mut().enumerate() {
-                    *v *= 0.5
-                        - 0.5
-                            * (2.0 * std::f32::consts::PI * n as f32 / (FFT_SIZE - 1) as f32).cos();
+                for (sample, &weight) in self.fft_buffer.iter_mut().zip(&self.window) {
+                    *sample *= weight;
                 }
                 self.fft.process(&mut self.fft_buffer);
                 for i in 0..FFT_SIZE {
@@ -112,6 +128,7 @@ impl Dsp {
                 }
                 self.fft_buffer.clear();
                 self.spectrum_frame += 1;
+                self.fft_skip = self.fft_gap;
             }
         }
     }
@@ -175,9 +192,13 @@ mod tests {
         let mut found_dmr = false;
         for block in rf_bytes.chunks(8192) {
             mixer.shift(block, &mut baseband);
-            dsp.process_samples(iq_samples(block).zip(baseband.iter().copied()), |event| {
-                found_dmr |= matches!(event, DigitalEvent::Dmr(_));
-            });
+            dsp.process_samples(
+                iq_samples(block).zip(baseband.iter().copied()),
+                true,
+                |event| {
+                    found_dmr |= matches!(event, DigitalEvent::Dmr(_));
+                },
+            );
         }
         assert!(found_dmr);
         let peak = dsp

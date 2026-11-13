@@ -4,6 +4,14 @@ SDR Studio is an experimental Linux desktop receiver for RTL-SDR, written in Rus
 
 ![SDR Studio demo showing the RF spectrum and waterfall](docs/images/sdr-studio-demo-en.webp)
 
+## What's new in 0.2.27
+
+- Switch between the waterfall and 3DSS below the RF spectrum. 3DSS shows signal level as height and history as depth.
+- Open **HF Propagation → Map** to see daylight and night across the globe. Enter your latitude and longitude to mark your location.
+- Expand **Source** and **Radio** in the left panel to reach the input and receiver controls. WFM offers 50 µs, 75 µs and off for de-emphasis. NFM has a 16 kHz marine filter preset.
+
+![3DSS mode showing the synthetic demo signal in perspective](docs/images/sdr-studio-3dss.webp)
+
 ## Features
 
 - RTL-SDR over USB, `rtl_tcp`, headerless interleaved CU8 IQ files, and a synthetic IQ demo.

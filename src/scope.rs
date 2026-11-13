@@ -24,6 +24,17 @@ struct WaterfallRow {
     bins: Vec<f32>,
 }
 
+impl WaterfallRow {
+    fn power_at(&self, band: Band, fraction: f64) -> Option<f32> {
+        let offset = f64::from(band.center_hz) - f64::from(self.band.center_hz);
+        let hz = offset + (fraction - 0.5) * band.span_hz;
+        let bin = hz / self.band.span_hz + 0.5;
+        (0.0..1.0)
+            .contains(&bin)
+            .then(|| self.bins[(bin * self.bins.len() as f64) as usize])
+    }
+}
+
 #[derive(Default)]
 struct Waterfall {
     band: Option<Band>,
@@ -59,21 +70,73 @@ impl Waterfall {
         self.rows.front()?;
         let mut image = egui::ColorImage::new([band.width, ROWS], BACKGROUND);
         for (pixels, row) in image.pixels.chunks_exact_mut(band.width).zip(&self.rows) {
-            let offset = f64::from(band.center_hz) - f64::from(row.band.center_hz);
             for (index, pixel) in pixels.iter_mut().enumerate() {
-                let hz = offset + ((index as f64 + 0.5) / band.width as f64 - 0.5) * band.span_hz;
-                let fraction = hz / row.band.span_hz + 0.5;
-                if (0.0..1.0).contains(&fraction) {
-                    *pixel = waterfall_color(row.bins[(fraction * row.bins.len() as f64) as usize]);
+                let fraction = (index as f64 + 0.5) / band.width as f64;
+                if let Some(power) = row.power_at(band, fraction) {
+                    *pixel = waterfall_color(power);
                 }
             }
         }
         Some(image)
     }
+    fn paint_3d(&self, painter: &egui::Painter, rect: Rect) {
+        let Some(band) = self.band else { return };
+        let project = |fraction: f32, age: f32, level: f32| {
+            let width = rect.width() * (1.0 - age * 0.30);
+            pos2(
+                rect.center().x + (fraction - 0.5) * width,
+                rect.bottom() - 1.0 - rect.height() * (age * 0.65 + level * 0.33),
+            )
+        };
+        let grid = Stroke::new(0.7_f32, GRID);
+        for tick in 0..=10 {
+            let x = tick as f32 / 10.0;
+            painter.line_segment([project(x, 0.0, 0.0), project(x, 1.0, 0.0)], grid);
+        }
+        for tick in 0..=6 {
+            let age = tick as f32 / 6.0;
+            painter.line_segment([project(0.0, age, 0.0), project(1.0, age, 0.0)], grid);
+        }
+
+        // Paint older traces first, so nearby signals occlude the history behind them.
+        let mut mesh = egui::Mesh::default();
+        let columns = band.width.min(192);
+        for (index, row) in self
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(index, _)| index % 2 == 0)
+        {
+            let age = index as f32 / (ROWS - 1) as f32;
+            let mut previous = None;
+            for column in 0..columns {
+                let x = (column as f32 + 0.5) / columns as f32;
+                let Some(power) = row.power_at(band, f64::from(x)) else {
+                    previous = None;
+                    continue;
+                };
+                let level = ((power + 115.0) / 100.0).clamp(0.0, 1.0);
+                let top = project(x, age, level);
+                let bottom = project(x, age, 0.0);
+                let vertex = mesh.vertices.len() as u32;
+                let color = waterfall_color(power);
+                mesh.colored_vertex(top, color.gamma_multiply(1.0 - age * 0.55));
+                mesh.colored_vertex(bottom, color.gamma_multiply(0.42 - age * 0.18));
+                if let Some(previous) = previous {
+                    mesh.add_triangle(previous, previous + 1, vertex);
+                    mesh.add_triangle(vertex, previous + 1, vertex + 1);
+                }
+                previous = Some(vertex);
+            }
+        }
+        painter.add(Shape::mesh(mesh));
+    }
 }
 
 pub struct Scope {
     zoom: usize,
+    pub three_dimensional: bool,
     fixed_center: Option<u32>,
     waterfall: Waterfall,
     texture: Option<egui::TextureHandle>,
@@ -83,6 +146,7 @@ impl Default for Scope {
     fn default() -> Self {
         Self {
             zoom: 1,
+            three_dimensional: false,
             fixed_center: None,
             waterfall: Waterfall::default(),
             texture: None,
@@ -214,7 +278,10 @@ impl Scope {
         } else {
             0
         };
-        if self.waterfall.update(band, frame, bins) {
+        let history_changed = self.waterfall.update(band, frame, bins);
+        if self.three_dimensional {
+            self.texture = None;
+        } else if history_changed || self.texture.is_none() {
             if let Some(image) = self.waterfall.image() {
                 if let Some(texture) = &mut self.texture {
                     texture.set(image, egui::TextureOptions::NEAREST);
@@ -282,10 +349,18 @@ impl Scope {
         }
 
         let fall_height = (ui.available_height() - view.reserve_height - 49.0).max(40.0);
-        let (fall, waterfall) =
-            ui.allocate_exact_size(vec2(ui.available_width(), fall_height), sense);
+        let (fall, waterfall) = ui.allocate_exact_size(
+            vec2(ui.available_width(), fall_height),
+            if self.three_dimensional {
+                Sense::hover()
+            } else {
+                sense
+            },
+        );
         ui.painter().rect_filled(fall, 0.0, BACKGROUND);
-        if let Some(texture) = &self.texture {
+        if self.three_dimensional {
+            self.waterfall.paint_3d(&ui.painter_at(fall), fall);
+        } else if let Some(texture) = &self.texture {
             ui.painter().image(
                 texture.id(),
                 fall,
@@ -330,6 +405,17 @@ impl Scope {
                     ui.selectable_value(&mut self.zoom, zoom, format!("×{zoom}"));
                 });
             }
+            ui.separator();
+            ui.selectable_value(
+                &mut self.three_dimensional,
+                false,
+                crate::tr!("Cascada", "Waterfall"),
+            );
+            ui.selectable_value(&mut self.three_dimensional, true, "3DSS")
+                .on_hover_text(crate::tr!(
+                    "Altura: nivel · Profundidad: historial",
+                    "Height: signal level · Depth: history"
+                ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     RichText::new(format!("{low_mhz:.6} – {high_mhz:.6} MHz"))

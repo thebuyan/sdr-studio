@@ -4,7 +4,10 @@ use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
 use std::{
     process::Command,
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::{
+        mpsc::{self, Receiver, TryRecvError},
+        OnceLock,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -104,6 +107,7 @@ fn latest_observation(
 #[derive(Default)]
 pub struct Panel {
     open: bool,
+    map_view: bool,
     latitude: String,
     longitude: String,
     weather: Option<Weather>,
@@ -242,7 +246,11 @@ impl Panel {
                 );
                 ui.separator();
 
-                let elevation = self.elevation();
+                let location = coordinate(&self.latitude, 90.0)
+                    .zip(coordinate(&self.longitude, 180.0));
+                let sun = Solar::at(SystemTime::now().duration_since(UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64());
+                let elevation = location.map(|(lat, lon)| sun.elevation(lat, lon));
                 let light = elevation.map(Light::from_elevation);
                 let summary = match elevation.zip(light) {
                     Some((elevation, light)) => {
@@ -262,27 +270,23 @@ impl Panel {
                     .into(),
                 };
                 ui.label(summary);
-                ui.horizontal_top(|ui| {
-                    table(
-                        ui,
-                        crate::tr!("Radioafición", "Amateur radio"),
-                        AMATEUR,
-                        light,
-                        self.weather.as_ref(),
-                    );
-                    ui.add_space(12.0);
-                    table(
-                        ui,
-                        crate::tr!("Onda corta", "Shortwave"),
-                        SHORTWAVE,
-                        light,
-                        self.weather.as_ref(),
-                    );
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.map_view, false, crate::tr!("Bandas", "Bands"));
+                    ui.selectable_value(&mut self.map_view, true, crate::tr!("Mapa", "Map"));
                 });
+                if self.map_view {
+                    world_map(ui, sun, location);
+                } else {
+                    ui.horizontal_top(|ui| {
+                        table(ui, crate::tr!("Radioafición", "Amateur radio"), AMATEUR, light, self.weather.as_ref());
+                        ui.add_space(12.0);
+                        table(ui, crate::tr!("Onda corta", "Shortwave"), SHORTWAVE, light, self.weather.as_ref());
+                    });
+                }
                 ui.label(
                     RichText::new(crate::tr!(
-                        "Orientación local. Una apertura real depende de la ruta.",
-                        "Local guidance. Actual openings depend on the path."
+                        "Estimación local. Cerrada indica baja probabilidad; la apertura depende de la ruta.",
+                        "Local estimate. Closed means unlikely; openings depend on the path."
                     ))
                     .small(),
                 );
@@ -291,16 +295,6 @@ impl Panel {
         if refresh {
             self.refresh();
         }
-    }
-
-    fn elevation(&self) -> Option<f64> {
-        let latitude = coordinate(&self.latitude, 90.0)?;
-        let longitude = coordinate(&self.longitude, 180.0)?;
-        let unix_seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_secs_f64();
-        Some(solar_elevation(unix_seconds, latitude, longitude))
     }
 }
 
@@ -324,23 +318,144 @@ fn show_observation(ui: &mut egui::Ui, name: &str, observation: Option<&Observat
 }
 
 // Solar coordinates and sidereal time approximations from USNO, epoch J2000.0.
-fn solar_elevation(unix_seconds: f64, latitude: f64, longitude: f64) -> f64 {
-    let d = (unix_seconds - 946_728_000.0) / 86_400.0;
-    let g = (357.529 + 0.985_600_28 * d).rem_euclid(360.0).to_radians();
-    let q = 280.459 + 0.985_647_36 * d;
-    let l = (q + 1.915 * g.sin() + 0.020 * (2.0 * g).sin())
-        .rem_euclid(360.0)
-        .to_radians();
-    let e = (23.439 - 0.000_000_36 * d).to_radians();
-    let declination = (e.sin() * l.sin()).asin();
-    let right_ascension = (e.cos() * l.sin()).atan2(l.cos());
-    let sidereal = (280.460_618_37 + 360.985_647_366_29 * d + longitude).rem_euclid(360.0);
-    let hour_angle = sidereal.to_radians() - right_ascension;
-    let lat = latitude.to_radians();
-    (lat.sin() * declination.sin() + lat.cos() * declination.cos() * hour_angle.cos())
-        .clamp(-1.0, 1.0)
-        .asin()
-        .to_degrees()
+struct Solar {
+    declination: f64,
+    greenwich_hour_angle: f64,
+}
+
+impl Solar {
+    fn at(unix_seconds: f64) -> Self {
+        let d = (unix_seconds - 946_728_000.0) / 86_400.0;
+        let g = (357.529 + 0.985_600_28 * d).rem_euclid(360.0).to_radians();
+        let q = 280.459 + 0.985_647_36 * d;
+        let l = (q + 1.915 * g.sin() + 0.020 * (2.0 * g).sin())
+            .rem_euclid(360.0)
+            .to_radians();
+        let e = (23.439 - 0.000_000_36 * d).to_radians();
+        let declination = (e.sin() * l.sin()).asin();
+        let right_ascension = (e.cos() * l.sin()).atan2(l.cos());
+        let sidereal = (280.460_618_37 + 360.985_647_366_29 * d).rem_euclid(360.0);
+        Self {
+            declination,
+            greenwich_hour_angle: sidereal.to_radians() - right_ascension,
+        }
+    }
+
+    fn elevation(&self, latitude: f64, longitude: f64) -> f64 {
+        let lat = latitude.to_radians();
+        let hour_angle = self.greenwich_hour_angle + longitude.to_radians();
+        (lat.sin() * self.declination.sin() + lat.cos() * self.declination.cos() * hour_angle.cos())
+            .clamp(-1.0, 1.0)
+            .asin()
+            .to_degrees()
+    }
+}
+
+fn world_map(ui: &mut egui::Ui, sun: Solar, location: Option<(f64, f64)>) {
+    const DAY: Color32 = Color32::from_rgb(38, 69, 88);
+    const TWILIGHT: Color32 = Color32::from_rgb(50, 44, 78);
+    const NIGHT: Color32 = Color32::from_rgb(11, 19, 41);
+    static LAND: OnceLock<Vec<Vec<[f32; 2]>>> = OnceLock::new();
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, width * 0.46), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let project = |lat: f32, lon: f32| {
+        egui::pos2(
+            rect.left() + rect.width() * (lon + 180.0) / 360.0,
+            rect.top() + rect.height() * (90.0 - lat) / 180.0,
+        )
+    };
+    for lat in (-90..90).step_by(5) {
+        for lon in (-180..180).step_by(5) {
+            let color = match Light::from_elevation(
+                sun.elevation(f64::from(lat) + 2.5, f64::from(lon) + 2.5),
+            ) {
+                Light::Day => DAY,
+                Light::Twilight => TWILIGHT,
+                Light::Night => NIGHT,
+            };
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    project((lat + 5) as f32, lon as f32),
+                    project(lat as f32, (lon + 5) as f32),
+                ),
+                0.0,
+                color,
+            );
+        }
+    }
+    let line = egui::Stroke::new(0.5_f32, Color32::from_white_alpha(30));
+    for lon in (-150..180).step_by(30) {
+        painter.line_segment(
+            [project(-90.0, lon as f32), project(90.0, lon as f32)],
+            line,
+        );
+    }
+    for lat in (-60..90).step_by(30) {
+        painter.line_segment(
+            [project(lat as f32, -180.0), project(lat as f32, 180.0)],
+            line,
+        );
+    }
+    let coast = egui::Stroke::new(0.8_f32, Color32::from_rgb(163, 187, 195));
+    for ring in LAND.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/world-land.json"))
+            .expect("bundled Natural Earth coastline rings")
+    }) {
+        let mut points = Vec::new();
+        for &[lon, lat] in ring {
+            if points.last().is_some_and(|last: &egui::Pos2| {
+                (last.x - project(lat, lon).x).abs() > rect.width() / 2.0
+            }) {
+                painter.add(egui::Shape::line(std::mem::take(&mut points), coast));
+            }
+            points.push(project(lat, lon));
+        }
+        if points.len() > 1 {
+            painter.add(egui::Shape::line(points, coast));
+        }
+    }
+    if let Some((lat, lon)) = location {
+        let point = project(lat as f32, lon as f32);
+        painter.circle_filled(point, 6.0, NIGHT);
+        painter.circle_filled(point, 4.0, crate::panel::AMBER);
+    }
+    ui.horizontal_wrapped(|ui| {
+        for (label, color) in [
+            (Light::Day.name(), DAY),
+            (Light::Twilight.name(), TWILIGHT),
+            (Light::Night.name(), NIGHT),
+            (
+                crate::tr!("Tu ubicación", "Your location"),
+                crate::panel::AMBER,
+            ),
+        ] {
+            ui.label(RichText::new("●").color(color.gamma_multiply(1.8)));
+            ui.label(label);
+        }
+    });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Quality {
+    Closed,
+    Poor,
+    Fair,
+    Good,
+}
+
+impl Quality {
+    fn display(self) -> (&'static str, Color32) {
+        match self {
+            Self::Good => (
+                crate::tr!("Buena", "Good"),
+                Color32::from_rgb(136, 213, 147),
+            ),
+            Self::Fair => (crate::tr!("Regular", "Fair"), crate::panel::AMBER),
+            Self::Poor => (crate::tr!("Mala", "Poor"), Color32::from_rgb(255, 145, 117)),
+            Self::Closed => (crate::tr!("Cerrada", "Closed"), Color32::from_gray(156)),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -369,32 +484,31 @@ impl Light {
         }
     }
 
-    fn guidance(self, mhz: f64, weather: Option<&Weather>) -> (&'static str, Color32) {
-        let try_first: (&str, Color32) = (
-            crate::tr!("Explorar primero", "Try first"),
-            Color32::from_rgb(136, 213, 147),
-        );
-        const VARIABLE: (&str, Color32) = ("Variable", crate::panel::AMBER);
-        let secondary: (&str, Color32) = (
-            crate::tr!("Menor prioridad", "Lower priority"),
-            Color32::from_rgb(166, 168, 163),
-        );
+    fn guidance(self, mhz: f64, weather: Option<&Weather>) -> Quality {
+        use Quality::{Closed, Fair, Good, Poor};
+        let flux = weather.and_then(|w| w.flux.as_ref()).map(|o| o.value);
         let disturbed = weather
-            .and_then(|weather| weather.kp.as_ref())
-            .is_some_and(|kp| kp.value >= 5.0);
-        let elevated_flux = weather
-            .and_then(|weather| weather.flux.as_ref())
-            .is_some_and(|flux| flux.value >= 100.0);
-        match self {
-            Self::Day if disturbed && mhz >= 9.0 => VARIABLE,
-            Self::Day if (9.0..=18.0).contains(&mhz) => try_first,
-            Self::Day if (18.0..=22.0).contains(&mhz) && elevated_flux => try_first,
-            Self::Day if mhz >= 18.0 => VARIABLE,
-            Self::Twilight if mhz <= 15.0 => try_first,
-            Self::Twilight => VARIABLE,
-            Self::Night if mhz < 9.0 => try_first,
-            Self::Night if mhz <= 15.0 => VARIABLE,
-            _ => secondary,
+            .and_then(|w| w.kp.as_ref())
+            .is_some_and(|o| o.value >= 5.0);
+        let quality = match self {
+            Self::Day if mhz < 5.0 => Poor,
+            Self::Day if mhz < 9.0 => Fair,
+            Self::Day if mhz <= 18.0 => Good,
+            Self::Day if mhz <= 22.0 && flux.is_some_and(|f| f >= 100.0) => Good,
+            Self::Day if mhz <= 25.0 || flux.is_some_and(|f| f >= 135.0) => Fair,
+            Self::Day => Poor,
+            Self::Twilight if mhz <= 15.0 => Good,
+            Self::Twilight if mhz <= 22.0 => Fair,
+            Self::Twilight => Poor,
+            Self::Night if mhz < 9.0 => Good,
+            Self::Night if mhz <= 15.0 => Fair,
+            Self::Night if mhz <= 22.0 => Poor,
+            Self::Night => Closed,
+        };
+        if disturbed && mhz >= 9.0 && quality == Good {
+            Fair
+        } else {
+            quality
         }
     }
 }
@@ -419,7 +533,7 @@ fn table(
                             crate::tr!("Pendiente", "Awaiting location"),
                             Color32::from_gray(135),
                         ),
-                        |light| light.guidance(mhz, weather),
+                        |light| light.guidance(mhz, weather).display(),
                     );
                     ui.label(RichText::new(label).color(color));
                     ui.end_row();
@@ -435,8 +549,8 @@ mod tests {
     #[test]
     fn location_and_time_change_the_solar_elevation() {
         let equinox_noon = 1_742_472_000.0;
-        assert!(solar_elevation(equinox_noon, 0.0, 0.0) > 85.0);
-        assert!(solar_elevation(equinox_noon, 0.0, 180.0) < -85.0);
+        assert!(Solar::at(equinox_noon).elevation(0.0, 0.0) > 85.0);
+        assert!(Solar::at(equinox_noon).elevation(0.0, 180.0) < -85.0);
         assert_eq!(coordinate("-33,45", 90.0), Some(-33.45));
         assert_eq!(coordinate("91", 90.0), None);
     }

@@ -339,6 +339,10 @@ fn run(
             if mode.channels() != settings.mode.channels() {
                 audio = None;
             }
+            if settings.mode == Mode::Digital && plugins.is_empty() {
+                dsp.retune(false);
+                decoder = Decoder::default();
+            }
             mode = settings.mode;
             dmr_voice = None;
             dmr_audio_failed = false;
@@ -380,7 +384,7 @@ fn run(
                         if audio.is_none() {
                             audio = Some(Playback::open_at(1, dmr_audio::RATE)?);
                         }
-                        audio.as_ref().unwrap().send(pcm)?;
+                        audio.as_mut().unwrap().send(pcm)?;
                     }
                     Ok::<(), String>(())
                 })();
@@ -393,10 +397,15 @@ fn run(
             }
             DigitalEvent::DmrVoice(..) => {}
         };
+        let decode = mode == Mode::Digital || !plugins.is_empty();
         if mixer.is_some() {
-            dsp.process_samples(iq_samples(&aligned).zip(shifted.iter().copied()), emit);
+            dsp.process_samples(
+                iq_samples(&aligned).zip(shifted.iter().copied()),
+                decode,
+                emit,
+            );
         } else {
-            dsp.process(&aligned, emit);
+            dsp.process_samples(iq_samples(&aligned).map(|iq| (iq, iq)), decode, emit);
         }
         if mode != Mode::Digital {
             let pcm = if mixer.is_some() {
@@ -404,7 +413,7 @@ fn run(
             } else {
                 analog.process(&aligned, settings)
             };
-            if let Some(playback) = &audio {
+            if let Some(playback) = &mut audio {
                 if let Err(error) = playback.send(pcm) {
                     state.lock().unwrap().audio_error = Some(error);
                     audio = None;

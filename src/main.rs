@@ -211,6 +211,7 @@ impl App {
             "mode": self.radio.mode.name(),
             "bandwidth": self.radio.bandwidth,
             "volume": self.radio.volume,
+            "wfm_deemphasis_us": self.radio.wfm_deemphasis_us,
             "muted": self.radio.muted,
             "squelch": self.radio.squelch.is_some(),
             "squelch_level": self.squelch_level,
@@ -233,6 +234,7 @@ impl App {
             "gain_db": self.gain_db,
             "automatic_gain": self.automatic_gain,
             "zoom": self.scope.zoom(),
+            "scope_3d": self.scope.three_dimensional,
             "fixed_center_hz": self.scope.fixed_center(),
             "show_dmr": self.show_dmr,
             "show_p25": self.show_p25,
@@ -314,6 +316,9 @@ impl App {
         self.radio.bandwidth = get(data, "bandwidth")
             .filter(|b| widths.contains(b))
             .unwrap_or(self.radio.bandwidth);
+        self.radio.wfm_deemphasis_us = get(data, "wfm_deemphasis_us")
+            .filter(|value| [0, 50, 75].contains(value))
+            .unwrap_or(50);
         self.radio.volume = get(data, "volume")
             .filter(|v| (0.0..=1.0).contains(v))
             .unwrap_or(self.radio.volume);
@@ -331,6 +336,7 @@ impl App {
         self.receiver.set_radio(self.radio);
 
         self.scope.set_zoom(get(data, "zoom").unwrap_or(1));
+        self.scope.three_dimensional = get(data, "scope_3d").unwrap_or(false);
         if self.config.kind != SourceKind::File {
             let fixed = get::<u32>(data, "fixed_center_hz")
                 .filter(|&center| self.config.tuner_frequency(center).is_ok());
@@ -863,12 +869,6 @@ impl App {
     }
 
     fn radio_controls(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new(crate::tr!("AUDIO Y FILTRO", "AUDIO AND FILTER"))
-                .monospace()
-                .color(MUTED)
-                .size(12.0),
-        );
         let before = self.radio;
         ui.add_enabled_ui(self.radio.mode != Mode::Digital, |ui| {
             ui.horizontal(|ui| {
@@ -884,6 +884,26 @@ impl App {
                         .suffix(" Hz"),
                 );
             });
+            if self.radio.mode == Mode::Nfm {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.radio.bandwidth, 12_500, "12.5 kHz");
+                    ui.selectable_value(
+                        &mut self.radio.bandwidth,
+                        16_000,
+                        crate::tr!("Marina · 16 kHz", "Marine · 16 kHz"),
+                    );
+                });
+            }
+            if self.radio.mode == Mode::Wfm {
+                ui.horizontal(|ui| {
+                    ui.label(crate::tr!("Deénfasis", "De-emphasis"));
+                    for (value, label) in
+                        [(0, crate::tr!("Sin", "Off")), (50, "50 µs"), (75, "75 µs")]
+                    {
+                        ui.selectable_value(&mut self.radio.wfm_deemphasis_us, value, label);
+                    }
+                });
+            }
             if self.radio.mode == Mode::Am {
                 ui.horizontal(|ui| {
                     for (label, width) in [
@@ -1190,32 +1210,7 @@ impl App {
         (!self.automatic_gain).then(|| (self.gain_db * 10.0).round() as i32)
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui, busy: bool) {
-        ui.horizontal(|ui| {
-            ui.label(crate::tr!("Idioma", "Language"));
-            let mut language = Language::current();
-            egui::ComboBox::from_id_salt("language")
-                .selected_text(match language {
-                    Language::Spanish => "Español",
-                    Language::English => "English",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut language, Language::Spanish, "Español");
-                    ui.selectable_value(&mut language, Language::English, "English");
-                });
-            language.set();
-        });
-        ui.separator();
-        self.propagation.button(ui);
-        self.scan_controls(ui);
-        self.radio_controls(ui);
-        ui.separator();
-        ui.label(
-            RichText::new(crate::tr!("ENTRADA", "INPUT"))
-                .color(MUTED)
-                .size(12.0),
-        );
-        ui.add_space(6.0);
+    fn source_controls(&mut self, ui: &mut egui::Ui, busy: bool) {
         ui.add_enabled_ui(!busy, |ui| {
             let previous_kind = self.config.kind;
             let previous_rate = self.config.sample_rate;
@@ -1267,8 +1262,8 @@ impl App {
                 .selected_text(format!("{} S/s", self.config.sample_rate))
                 .show_ui(ui, |ui| {
                     for rate in [
-                        240_000, 256_000, 960_000, 1_024_000, 2_048_000, 2_400_000, 2_560_000,
-                        2_800_000, 3_200_000,
+                        240_000, 250_000, 256_000, 960_000, 1_024_000, 2_048_000, 2_400_000,
+                        2_560_000, 2_800_000, 3_200_000,
                     ] {
                         ui.selectable_value(
                             &mut self.config.sample_rate,
@@ -1335,6 +1330,35 @@ impl App {
                 self.receiver.set_gain(gain);
             }
         }
+    }
+
+    fn controls(&mut self, ui: &mut egui::Ui, busy: bool) {
+        ui.horizontal(|ui| {
+            ui.label(crate::tr!("Idioma", "Language"));
+            let mut language = Language::current();
+            egui::ComboBox::from_id_salt("language")
+                .selected_text(match language {
+                    Language::Spanish => "Español",
+                    Language::English => "English",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut language, Language::Spanish, "Español");
+                    ui.selectable_value(&mut language, Language::English, "English");
+                });
+            language.set();
+        });
+        ui.separator();
+        self.propagation.button(ui);
+        self.scan_controls(ui);
+        egui::CollapsingHeader::new(crate::tr!("Fuente", "Source"))
+            .id_salt("source_controls")
+            .default_open(true)
+            .show(ui, |ui| self.source_controls(ui, busy));
+        ui.separator();
+        egui::CollapsingHeader::new(crate::tr!("Radio", "Radio"))
+            .id_salt("radio_controls")
+            .default_open(true)
+            .show(ui, |ui| self.radio_controls(ui));
         ui.add_space(8.0);
         ui.separator();
         ui.label(

@@ -12,6 +12,14 @@ decodificación completa de datos digitales siguen pendientes.
 
 ![Demostración de SDR Studio con el espectro RF y la cascada](docs/images/sdr-studio-demo-es.webp)
 
+## Novedades de la versión 0.2.27
+
+- Alterna entre **Cascada** y **3DSS** debajo del espectro. En 3DSS, la altura indica el nivel de señal y la profundidad muestra el historial.
+- Abre **Propagación HF → Mapa** para ver qué zonas del mundo están de día o de noche. Introduce tus coordenadas para marcar tu ubicación.
+- Despliega **Fuente** y **Radio** en el panel izquierdo. En WFM puedes ajustar el deénfasis a 50 µs, 75 µs o desactivarlo. En NFM está disponible el filtro marino de 16 kHz.
+
+![Vista 3DSS de la señal sintética de la demostración](docs/images/sdr-studio-3dss.webp)
+
 ## Estado real
 
 | Función | Estado |

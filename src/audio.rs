@@ -93,6 +93,7 @@ pub struct Settings {
     pub mode: Mode,
     pub bandwidth: u32,
     pub volume: f32,
+    pub wfm_deemphasis_us: u32,
     pub squelch: Option<f32>,
     pub muted: bool,
     pub am_agc: bool,
@@ -105,6 +106,7 @@ impl Default for Settings {
             mode: Mode::Digital,
             bandwidth: 12_500,
             volume: 0.55,
+            wfm_deemphasis_us: 50,
             squelch: None,
             muted: false,
             am_agc: true,
@@ -127,6 +129,9 @@ pub struct Analog {
     anti_alias: ChannelFilter,
     sideband: SidebandFilter,
     bfo_phase: f32,
+    nfm_deemphasis: f32,
+    wfm_iq_dc: Option<Complex32>,
+    wfm_deemphasis: f32,
     am_carrier: f32,
     am_samples: u32,
 }
@@ -147,6 +152,9 @@ impl Analog {
             anti_alias: ChannelFilter::default(),
             sideband: SidebandFilter::default(),
             bfo_phase: 0.0,
+            nfm_deemphasis: 0.0,
+            wfm_iq_dc: None,
+            wfm_deemphasis: 0.0,
             am_carrier: 0.0,
             am_samples: 0,
         }
@@ -166,9 +174,14 @@ impl Analog {
         }
         let rate = self.input_rate as f32;
         let cutoff = (settings.bandwidth as f32 * 0.5).min(rate * 0.45);
-        let channel_alpha = low_pass_alpha(cutoff, rate);
+        let wfm = settings.mode == Mode::Wfm;
+        let iq_dc_alpha = low_pass_alpha(100.0, rate);
+        let wfm_deemphasis_alpha = match settings.wfm_deemphasis_us {
+            0 => 1.0,
+            micros => 1.0 - (-1_000_000.0 / (micros as f32 * RATE as f32)).exp(),
+        };
         let audio_cutoff = match settings.mode {
-            Mode::Wfm => 12_000.0,
+            Mode::Wfm => 14_000.0,
             Mode::Am => cutoff.min(4500.0),
             _ => 3_000.0,
         };
@@ -179,24 +192,29 @@ impl Analog {
         } else {
             0.025
         };
-        if am {
-            self.channel_filter
-                .configure(self.input_rate, settings.bandwidth);
-        }
+        let nfm = settings.mode == Mode::Nfm;
+        let deemphasis_alpha = low_pass_alpha(1061.0, RATE as f32);
+        self.channel_filter
+            .configure(self.input_rate, settings.bandwidth);
         let mut pcm =
             Vec::with_capacity(samples.len() * 2 * RATE as usize / self.input_rate as usize + 2);
         let threshold = self.squelch_threshold(settings.squelch);
         for iq in samples {
-            if am {
-                self.filtered = self.channel_filter.process(iq);
+            let iq = if wfm {
+                let dc = self.wfm_iq_dc.get_or_insert(iq);
+                *dc += (iq - *dc) * iq_dc_alpha;
+                iq - *dc
             } else {
-                self.filtered += (iq - self.filtered) * channel_alpha;
-            }
+                iq
+            };
+            self.filtered = self.channel_filter.process(iq);
             let value = match settings.mode {
                 Mode::Am => self.filtered.norm(),
                 Mode::Nfm | Mode::Wfm => {
                     let deviation = if settings.mode == Mode::Wfm {
                         75_000.0
+                    } else if settings.bandwidth >= 16_000 {
+                        5_000.0
                     } else {
                         2_500.0
                     };
@@ -215,6 +233,15 @@ impl Analog {
             let audio = self.low_pass[1];
             self.dc += dc_alpha * (audio - self.dc);
             let mut level = audio - self.dc;
+            if nfm {
+                // 150 µs de-emphasis reduces high-frequency discriminator noise.
+                self.nfm_deemphasis += deemphasis_alpha * (level - self.nfm_deemphasis);
+                level = self.nfm_deemphasis;
+            } else if wfm {
+                // Broadcast FM de-emphasis, after demodulation.
+                self.wfm_deemphasis += wfm_deemphasis_alpha * (level - self.wfm_deemphasis);
+                level = self.wfm_deemphasis;
+            }
             if am {
                 // Track the carrier more slowly than the audio, with a gain ceiling.
                 let alpha = if self.dc > self.am_carrier {
@@ -237,7 +264,19 @@ impl Analog {
                 1.0
             };
             let pcm_value = if open && !settings.muted {
-                (level.clamp(-1.0, 1.0) * 22_000.0 * settings.volume * fade) as i16
+                let level = if nfm {
+                    // Leave room for FM noise peaks without flattening them.
+                    let magnitude = level.abs();
+                    if magnitude > 0.75 {
+                        let excess = magnitude - 0.75;
+                        (0.75 + excess / (1.0 + excess * 2.0)).copysign(level)
+                    } else {
+                        level
+                    }
+                } else {
+                    level.clamp(-1.0, 1.0)
+                };
+                (level * 22_000.0 * settings.volume * fade) as i16
             } else {
                 0
             };
@@ -444,6 +483,8 @@ pub struct Playback {
     child: Child,
     sender: Option<SyncSender<Vec<u8>>>,
     writer: Option<JoinHandle<()>>,
+    pending: Vec<u8>,
+    block_bytes: usize,
 }
 
 impl Playback {
@@ -471,7 +512,11 @@ impl Playback {
                 )
             })?;
         let mut stdin = child.stdin.take().unwrap();
-        let (sender, queue) = mpsc::sync_channel::<Vec<u8>>(2);
+        let block_bytes = (rate / 100 * channels * 2) as usize;
+        // Buffer by audio duration. At high IQ rates a read may represent
+        // only a few milliseconds, so a queue of two IQ-sized blocks is too short.
+        let queue_blocks = if rate == RATE { 12 } else { 4 };
+        let (sender, queue) = mpsc::sync_channel::<Vec<u8>>(queue_blocks);
         let writer = thread::spawn(move || {
             while let Ok(pcm) = queue.recv() {
                 if stdin.write_all(&pcm).is_err() {
@@ -483,10 +528,21 @@ impl Playback {
             child,
             sender: Some(sender),
             writer: Some(writer),
+            pending: Vec::with_capacity(block_bytes),
+            block_bytes,
         })
     }
 
-    pub fn send(&self, pcm: Vec<u8>) -> Result<(), String> {
+    pub fn send(&mut self, pcm: Vec<u8>) -> Result<(), String> {
+        let pcm = if self.pending.is_empty() && pcm.len() >= self.block_bytes {
+            pcm
+        } else {
+            self.pending.extend_from_slice(&pcm);
+            if self.pending.len() < self.block_bytes {
+                return Ok(());
+            }
+            std::mem::replace(&mut self.pending, Vec::with_capacity(self.block_bytes))
+        };
         match self.sender.as_ref().unwrap().try_send(pcm) {
             Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
             Err(TrySendError::Disconnected(_)) => {
@@ -652,6 +708,41 @@ mod tests {
             component(700.0) < desired / 8.0,
             "La portadora vecina domina el audio"
         );
+    }
+
+    #[test]
+    fn marine_nfm_recovers_five_khz_deviation_next_to_a_strong_channel() {
+        for input_rate in [240_000, 2_560_000] {
+            let iq: Vec<u8> = (0..input_rate / 4)
+                .flat_map(|n| {
+                    let t = f64::from(n) / f64::from(input_rate);
+                    let tau = std::f64::consts::TAU;
+                    let wanted = Complex64::from_polar(22.0, -5.0 * (tau * 1000.0 * t).cos());
+                    let adjacent = Complex64::from_polar(
+                        68.0,
+                        tau * 25_000.0 * t - 2.5 * (tau * 2000.0 * t).cos(),
+                    );
+                    let sample = wanted + adjacent;
+                    [
+                        (127.5 + sample.re).round() as u8,
+                        (127.5 + sample.im).round() as u8,
+                    ]
+                })
+                .collect();
+            let settings = Settings {
+                mode: Mode::Nfm,
+                bandwidth: 16_000,
+                volume: 1.0,
+                ..Settings::default()
+            };
+            let pcm = Analog::new(input_rate).process(&iq, settings);
+            let wanted = audio_tone(&pcm, 1, 0, 1000.0);
+            let adjacent = audio_tone(&pcm, 1, 0, 2000.0);
+            assert!(
+                wanted > 7000.0 && adjacent < wanted / 8.0,
+                "{wanted}, {adjacent}"
+            );
+        }
     }
 
     #[test]
